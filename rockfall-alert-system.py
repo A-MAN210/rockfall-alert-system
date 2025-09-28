@@ -123,6 +123,7 @@ cnn_features = np.random.rand(len(X_spatial), 16)  # 16 spatial features
 print("CNN Features: Shape", cnn_features.shape)
 
 # Train with Imbalance Handling
+def process_data():
    smote = SMOTE(random_state=42)
    X_res, y_res = smote.fit_resample(X_spatial, y)
 
