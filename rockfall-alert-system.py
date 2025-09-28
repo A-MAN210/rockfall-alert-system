@@ -173,7 +173,7 @@ prob_rockfall = model.predict_proba(X_new)[:, 1]
 def compute_risk_score(prob_rockfall, slope, rainfall, displacement):
     # Fixed the formula in the original code where rainfall and displacement were single numbers
     # Assumes input arrays are Pandas Series or NumPy arrays
-    risk = 1 / (1 + np.exp(-(prob_rockfall * 10 + slope/10 + rainfall/5 + displacement/0.1)))
+    risk = 1 / (1 + np.exp(-(prob_rockfall * 2 + slope/10 + rainfall/5 + displacement/1.0)))
     return np.clip(risk, 0, 1)
 
 # Now uses the features engineered in engineer_features()
@@ -186,9 +186,9 @@ def assess_risk_and_alert(prob_rockfall, spatial_df, risk_scores):
         risk = risk_scores[idx]
         if risk < 0.001:
             severity, action = "Low Risk (Green)", "Continue operations."
-        elif risk < 0.01:
+        elif risk < 0.2:
             severity, action = "Moderate Risk (Yellow)", "Increase vigilance."
-        elif risk < 0.05:
+        elif risk < 0.7:
             severity, action = "High Risk (Orange)", "Prepare evacuation."
         else:
             severity, action = "Imminent Risk (Red)", "Evacuate immediately!"
