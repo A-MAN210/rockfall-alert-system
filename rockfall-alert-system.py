@@ -7,10 +7,13 @@ Original file is located at
     https://colab.research.google.com/drive/1I6KeQg8fuXD-wdoTsJVVbXmKqOFVE16O
 """
 
+!pip install pandas numpy scikit-learn xgboost tensorflow shap imbalanced-learn matplotlib folium
+
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from sklearn.preprocessing import MinMaxScaler
 from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
 import tensorflow as tf
@@ -20,40 +23,45 @@ import shap
 import matplotlib.pyplot as plt
 import folium
 from folium import plugins
-# Note: smtplib, email.mime.text, and streamlit were removed as they aren't used in this code block
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-# Simulate Data (as in prototype)
-def simulate_data(n_samples=5000, n_timesteps=24):  # Smaller for Colab speed
-    np.random.seed(42)
+# Improved Simulation: Add correlations for realism (high risk rarer)
+def simulate_data(n_samples=5000, n_timesteps=24):
+    np.random.seed(42)  # Fixed seed for reproducibility
+
     x, y = np.meshgrid(np.linspace(0, 100, 100), np.linspace(0, 100, 100))
-    coords = np.column_stack([x.ravel()[:n_samples], y.ravel()[:n_samples]])  # Subset for speed
+    coords = np.column_stack([x.ravel()[:n_samples], y.ravel()[:n_samples]])
 
-    slope = np.random.uniform(20, 60, n_samples)
-    aspect = np.random.uniform(0, 360, n_samples)
+    # DEM: Base slope, but correlate with elevation (steeper at higher elev)
     elevation = np.random.uniform(1000, 1500, n_samples)
+    slope = np.random.uniform(20, 60, n_samples) * (elevation / 1500)  # Correlate: steeper higher up
+    aspect = np.random.uniform(0, 360, n_samples)
+
+    # Drone: Lower fracture in stable areas
     glcm_contrast = np.random.uniform(0.1, 10, n_samples)
-    surface_change = np.random.uniform(-0.5, 0.5, n_samples)
-    fracture_density = np.random.uniform(0, 5, n_samples)
+    surface_change = np.random.uniform(-0.1, 0.3, n_samples)  # Less extreme change
+    fracture_density = np.random.uniform(0, 3, n_samples) * (slope / 60)  # Correlate with slope
 
-    displacement = np.cumsum(np.random.normal(0, 0.01, (n_samples, n_timesteps)), axis=1)
-    pore_pressure = np.random.uniform(50, 150, (n_samples, n_timesteps))
-    vibration_events = np.random.poisson(1, (n_samples, n_timesteps))
+    # Sensors: Slower displacement, correlated with rain
+    rainfall_intensity = np.tile(np.random.uniform(0, 20, n_timesteps), (n_samples, 1))  # Milder rain (0-20 mm/hr)
+    displacement_base = np.random.normal(0, 0.005, n_samples)  # Slower base movement
+    displacement = np.cumsum(displacement_base[:, np.newaxis] + np.random.normal(0, 0.001, (n_samples, n_timesteps)) * rainfall_intensity / 10, axis=1)
+    pore_pressure = np.random.uniform(50, 120, (n_samples, n_timesteps))  # Milder
+    vibration_events = np.random.poisson(0.5, (n_samples, n_timesteps))  # Fewer events
 
-    rainfall_intensity = np.tile(np.random.uniform(0, 50, n_timesteps), (n_samples, 1))
-    temperature = np.random.uniform(-5, 25, (n_samples, n_timesteps))
-    humidity = np.random.uniform(40, 90, (n_samples, n_timesteps))
+    temperature = np.random.uniform(0, 20, (n_samples, n_timesteps))  # Milder temps
+    humidity = np.random.uniform(50, 80, (n_samples, n_timesteps))
 
-    time_since_blast = np.random.uniform(0, 168, n_samples)
-    historical_incidents = np.random.poisson(0.1, n_samples)
-    equipment_proximity = np.random.uniform(10, 100, n_samples)
+    time_since_blast = np.random.uniform(24, 168, n_samples)  # Longer since blast (safer)
+    historical_incidents = np.random.poisson(0.05, n_samples)  # Rarer incidents
+    equipment_proximity = np.random.uniform(20, 100, n_samples)
 
-    prob_rockfall = (slope / 60 + rainfall_intensity[:, -1] / 50 + np.abs(displacement[:, -1]) / 10 +
-                     fracture_density / 5 + historical_incidents) / 5
-    # --- CRITICAL FIX 1: DRASTICALLY reduce the probability weight ---
-    prob_rockfall = np.clip(prob_rockfall * 0.005, 0, 1) # Changed from 0.05 to 0.005
+    # Target: Lower base prob for realism (~2% positive)
+    prob_rockfall = (slope / 60 * 0.3 + rainfall_intensity[:, -1] / 20 * 0.2 + np.abs(displacement[:, -1]) / 5 * 0.2 +
+                     fracture_density / 3 * 0.2 + historical_incidents * 0.1)
+    prob_rockfall = np.clip(prob_rockfall * 0.05, 0, 0.5)  # Cap at 50% max prob, ~2% events
     rockfall_event = np.random.binomial(1, prob_rockfall, n_samples)
 
     spatial_df = pd.DataFrame({
@@ -82,31 +90,34 @@ def simulate_data(n_samples=5000, n_timesteps=24):  # Smaller for Colab speed
 
 spatial_df, ts_df = simulate_data()
 print("Data Simulated: {} spatial cells, {} time-series points".format(len(spatial_df), len(ts_df)))
+print("Positive Events (Rockfalls): {:.2%}".format(spatial_df['rockfall_event'].mean()))  # Should be ~2%
+
+from sklearn.preprocessing import MinMaxScaler
 
 def engineer_features(spatial_df, ts_df):
     spatial_df = spatial_df.copy()
-    spatial_df['slope_deriv'] = np.gradient(spatial_df['slope'].values)[:len(spatial_df)]  # Simple deriv
+    spatial_df['slope_deriv'] = np.gradient(spatial_df['slope'].values)[:len(spatial_df)]
     spatial_df['rainfall_24h'] = ts_df.groupby('cell_id')['rainfall_intensity'].sum().values
-    
-    # Calculate difference within each cell and then take the mean of the difference series for that cell
-    displacement_diff_mean = ts_df.groupby('cell_id')['displacement'].apply(lambda x: x.diff().fillna(0).mean())
-    pore_pressure_diff_mean = ts_df.groupby('cell_id')['pore_pressure'].apply(lambda x: x.diff().fillna(0).mean())
-
-    spatial_df['displacement_rate'] = displacement_diff_mean.values
-    spatial_df['pore_grad'] = pore_pressure_diff_mean.values
-    
+    spatial_df['displacement_rate'] = ts_df.groupby('cell_id')['displacement'].diff().fillna(0).mean()
+    spatial_df['pore_grad'] = ts_df.groupby('cell_id')['pore_pressure'].diff().fillna(0).mean()
     spatial_df['vib_freq'] = ts_df.groupby('cell_id')['vibration_events'].sum().values
     spatial_df['temp_range'] = ts_df.groupby('cell_id')['temperature'].max() - ts_df.groupby('cell_id')['temperature'].min()
     spatial_df['humidity_avg'] = ts_df.groupby('cell_id')['humidity'].mean()
     spatial_df['roughness'] = spatial_df['glcm_contrast'] * spatial_df['fracture_density']
 
     X_spatial = spatial_df.drop(['cell_id', 'x', 'y', 'rockfall_event'], axis=1)
+
+    # NEW: Normalize key features to [0,1] for stable sigmoid
+    scaler = MinMaxScaler()
+    key_features = ['slope', 'rainfall_24h', 'displacement_rate', 'fracture_density']
+    spatial_df[key_features] = scaler.fit_transform(spatial_df[key_features])
+
     y = spatial_df['rockfall_event']
     return X_spatial, y, spatial_df
 
 X_spatial, y, spatial_df = engineer_features(spatial_df, ts_df)
 print("Features Engineered: {} features".format(X_spatial.shape[1]))
-print(spatial_df.head())
+print("Normalized Sample:\n", spatial_df[['slope', 'rainfall_24h', 'displacement_rate']].head())
 
 # LSTM for Temporal Fusion
 def prepare_ts_features(ts_df):
@@ -130,69 +141,34 @@ print("LSTM Features: Shape", lstm_features.shape)
 cnn_features = np.random.rand(len(X_spatial), 16)  # 16 spatial features
 print("CNN Features: Shape", cnn_features.shape)
 
-# --- NEW: COMBINE ALL FEATURES FOR XGBOOST TRAINING ---
-X_combined = pd.concat([
-    X_spatial.reset_index(drop=True), 
-    pd.DataFrame(lstm_features, columns=[f'lstm_{i}' for i in range(lstm_features.shape[1])]),
-    pd.DataFrame(cnn_features, columns=[f'cnn_{i}' for i in range(cnn_features.shape[1])])
-], axis=1)
-print(f"Combined Features for XGBoost: {X_combined.shape[1]}")
-
-
 # Train with Imbalance Handling
-def process_data(X_data, y_data):
-    X_spatial_df = X_data.copy()
-    
-    # --- CRITICAL FIX 2: DISABLE SMOTE ---
-    X_res = X_spatial_df
-    y_res = y_data
-    # -------------------------------------
+   smote = SMOTE(random_state=42)
+   X_res, y_res = smote.fit_resample(X_spatial, y)
 
-    X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2, random_state=42)
+   X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2, random_state=42)
 
-    # Use scale_pos_weight to handle the imbalance instead of SMOTE (more robust)
-    # Estimate the weight: count_no_rockfall / count_rockfall
-    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    
-    model = XGBClassifier(
-        n_estimators=100, 
-        learning_rate=0.1, 
-        max_depth=6, 
-        random_state=42, 
-        use_label_encoder=False, 
-        eval_metric='logloss',
-        scale_pos_weight=scale_pos_weight # Added scale_pos_weight
-    )
-    model.fit(X_train, y_train)
+   model = XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=6, random_state=42)
+   model.fit(X_train, y_train)
 
-    y_pred = model.predict(X_test)
-    print("Classification Report (Imbalanced Data):\n", classification_report(y_test, y_pred))
+   y_pred = model.predict(X_test)
+   print("Classification Report:\n", classification_report(y_test, y_pred))
 
-    # SHAP Interpretability
-    explainer = shap.Explainer(model)
-    shap_values = explainer(X_test)
-    shap.summary_plot(shap_values, X_test, show=False)
-    plt.title("SHAP Feature Importance")
-    plt.show() # Displays inline in Colab
-    
-    return model
-
-# --- CRITICAL CHANGE: Pass the combined feature set to the training function ---
-model = process_data(X_combined, y)
-
+   # SHAP Interpretability
+   explainer = shap.Explainer(model)
+   shap_values = explainer(X_test)
+   shap.summary_plot(shap_values, X_test, show=False)
+   plt.title("SHAP Feature Importance")
+   plt.show()  # Displays inline in Colab
 
 # Predict on New Data (simulate real-time)
-# --- CRITICAL CHANGE: Use the combined feature set for prediction ---
-X_new = X_combined.copy()
+X_new = X_spatial.copy()
 prob_rockfall = model.predict_proba(X_new)[:, 1]
 
 # Probabilistic Risk Score
 def compute_risk_score(prob_rockfall, slope, rainfall, displacement):
-    # This formula is now much less likely to saturate as prob_rockfall is expected to be small
-    risk = 1 / (1 + np.exp(-(prob_rockfall * 2.0 + slope/100 + rainfall/20 + displacement/1.0)))
+    risk = 1 / (1 + np.exp(-(prob_rockfall * 10 + slope/10 + rainfall/5 + displacement/0.1)))
     return np.clip(risk, 0, 1)
 
-# Now uses the features engineered in engineer_features()
 risk_scores = compute_risk_score(prob_rockfall, spatial_df['slope'], spatial_df['rainfall_24h'], spatial_df['displacement_rate'])
 
 # ALARP-Based Alerts
@@ -200,20 +176,18 @@ def assess_risk_and_alert(prob_rockfall, spatial_df, risk_scores):
     alerts = []
     for idx, row in spatial_df.iterrows():
         risk = risk_scores[idx]
-        
-        # Thresholds are adjusted again to reflect the expected *lower* scores
-        if risk < 0.05:
+        if risk < 0.001:
             severity, action = "Low Risk (Green)", "Continue operations."
-        elif risk < 0.15:
+        elif risk < 0.01:
             severity, action = "Moderate Risk (Yellow)", "Increase vigilance."
-        elif risk < 0.35:
+        elif risk < 0.05:
             severity, action = "High Risk (Orange)", "Prepare evacuation."
-        else: # risk >= 0.35 (lower threshold than before, but should work with new data)
+        else:
             severity, action = "Imminent Risk (Red)", "Evacuate immediately!"
 
         if severity != "Low Risk (Green)":
             alerts.append({'cell_id': row['cell_id'], 'x': row['x'], 'y': row['y'],
-                            'risk': risk, 'severity': severity, 'action': action})
+                           'risk': risk, 'severity': severity, 'action': action})
             print(f"ALERT: Cell {row['cell_id']} ({row['x']:.1f}, {row['y']:.1f}): {severity} - {action} (Risk: {risk:.3f})")
 
     return alerts
@@ -224,15 +198,9 @@ print(f"\nTotal Alerts Generated: {len(alerts)}")
 # Risk Map (Interactive Folium)
 def create_risk_map(spatial_df, risk_scores):
     m = folium.Map(location=[spatial_df['y'].mean(), spatial_df['x'].mean()], zoom_start=10)
-    # Using the adjusted thresholds for map coloring
     for idx, row in spatial_df.iterrows():
         risk = risk_scores[idx]
-        # Align colors with new risk thresholds for visualization
-        color = 'green'
-        if risk >= 0.05 and risk < 0.15: color = 'yellow'
-        elif risk >= 0.15 and risk < 0.35: color = 'orange'
-        elif risk >= 0.35: color = 'red'
-        
+        color = 'green' if risk < 0.001 else 'yellow' if risk < 0.01 else 'orange' if risk < 0.05 else 'red'
         folium.CircleMarker(
             location=[row['y'], row['x']],
             radius=5, popup=f"Cell {row['cell_id']}: Risk {risk:.3f}",
@@ -243,6 +211,87 @@ def create_risk_map(spatial_df, risk_scores):
 m = create_risk_map(spatial_df, risk_scores)
 m.save('risk_map.html')  # Download this file from Colab (Files tab)
 print("Risk Map saved as 'risk_map.html' - Open in browser for interactive view!")
-# The display function is needed for rendering the map output in Colab
-# from IPython.display import display # Uncomment this if you get an error for display()
-# display(m)
+display(m)  # Tries to display in Colab (may need folium's display function)
+
+# Improved Probabilistic Risk Score: Softer scaling + cap
+def compute_risk_score(prob_rockfall, slope_norm, rainfall_norm, displacement_norm):
+    # Normalize inputs already done; softer weights
+    linear = (prob_rockfall * 5 + slope_norm * 2 + rainfall_norm * 1.5 + displacement_norm * 1.5)
+    risk = 1 / (1 + np.exp(-linear))
+    return np.clip(risk * 0.8, 0, 0.8)  # Cap at 0.8 max (prevents 1.0; adjust as needed)
+
+# Predict
+X_new = X_spatial.copy()
+prob_rockfall = model.predict_proba(X_new)[:, 1]
+
+# Compute risks with normalized features
+risk_scores = compute_risk_score(
+    prob_rockfall,
+    spatial_df['slope'],
+    spatial_df['rainfall_24h'],
+    spatial_df['displacement_rate']
+)
+
+print("Risk Score Stats: Min={:.3f}, Max={:.3f}, Mean={:.3f}".format(risk_scores.min(), risk_scores.max(), risk_scores.mean()))
+
+# Improved ALARP Alerts: Tuned thresholds for variety
+def assess_risk_and_alert(prob_rockfall, spatial_df, risk_scores, n_samples):
+    alerts = []
+    risk_levels = {
+        'green': 0, 'yellow': 0, 'orange': 0, 'red': 0
+    }
+
+    for idx, row in spatial_df.iterrows():
+        risk = risk_scores[idx]
+        if risk < 0.005:  # Tuned: Lower for green
+            severity, action = "Low Risk (Green)", "Continue operations."
+        elif risk < 0.02:
+            severity, action = "Moderate Risk (Yellow)", "Increase vigilance, restrict access."
+        elif risk < 0.1:  # Higher threshold for orange
+            severity, action = "High Risk (Orange)", "Immediate inspection, prepare evacuation."
+        else:
+            severity, action = "Imminent Risk (Red)", "Evacuate immediately, halt operations!"
+
+        risk_levels[severity.split()[-1][1:-1].lower()] += 1  # Count levels, remove parentheses
+
+        if severity != "Low Risk (Green)":
+            alerts.append({
+                'cell_id': row['cell_id'], 'x': row['x'], 'y': row['y'],
+                'risk': risk, 'severity': severity, 'action': action
+            })
+            print(f"ALERT: Cell {row['cell_id']} ({row['x']:.1f}, {row['y']:.1f}): {severity} - {action} (Risk: {risk:.3f})")
+
+    print(f"\nRisk Distribution: Green={risk_levels['green']} ({risk_levels['green']/n_samples*100:.1f}%), "
+          f"Yellow={risk_levels['yellow']} ({risk_levels['yellow']/n_samples*100:.1f}%), "
+          f"Orange={risk_levels['orange']} ({risk_levels['orange']/n_samples*100:.1f}%), "
+          f"Red={risk_levels['red']} ({risk_levels['red']/n_samples*100:.1f}%)")
+    print(f"Total Alerts Generated: {len(alerts)}")
+
+    return alerts
+
+alerts = assess_risk_and_alert(prob_rockfall, spatial_df, risk_scores, n_samples=len(spatial_df))
+
+# Risk Map (Same, but now varied colors)
+def create_risk_map(spatial_df, risk_scores):
+    m = folium.Map(location=[spatial_df['y'].mean(), spatial_df['x'].mean()], zoom_start=10)
+    for idx, row in spatial_df.iterrows():
+        risk = risk_scores[idx]
+        if risk < 0.005:
+            color = 'green'
+        elif risk < 0.02:
+            color = 'yellow'
+        elif risk < 0.1:
+            color = 'orange'
+        else:
+            color = 'red'
+        folium.CircleMarker(
+            location=[row['y'], row['x']],
+            radius=3, popup=f"Cell {row['cell_id']}: Risk {risk:.3f} - {color}",
+            color=color, fill=True, fillColor=color, fillOpacity=0.7
+        ).add_to(m)
+    return m
+
+m = create_risk_map(spatial_df, risk_scores)
+m.save('risk_map_improved.html')
+print("Improved Risk Map saved as 'risk_map_improved.html'")
+display(m)  # In Colab
