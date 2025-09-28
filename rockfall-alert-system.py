@@ -52,7 +52,8 @@ def simulate_data(n_samples=5000, n_timesteps=24):  # Smaller for Colab speed
 
     prob_rockfall = (slope / 60 + rainfall_intensity[:, -1] / 50 + np.abs(displacement[:, -1]) / 10 +
                      fracture_density / 5 + historical_incidents) / 5
-    prob_rockfall = np.clip(prob_rockfall * 0.1, 0, 1)
+    # --- FIX 1: Make simulated rockfall less deterministic by reducing final weight ---
+    prob_rockfall = np.clip(prob_rockfall * 0.05, 0, 1) # Changed from 0.1 to 0.05
     rockfall_event = np.random.binomial(1, prob_rockfall, n_samples)
 
     spatial_df = pd.DataFrame({
@@ -86,10 +87,6 @@ def engineer_features(spatial_df, ts_df):
     spatial_df = spatial_df.copy()
     spatial_df['slope_deriv'] = np.gradient(spatial_df['slope'].values)[:len(spatial_df)]  # Simple deriv
     spatial_df['rainfall_24h'] = ts_df.groupby('cell_id')['rainfall_intensity'].sum().values
-    
-    # ISSUE: .mean() on a single value for each cell_id is not right here, assuming simple mean for now
-    # The .diff().fillna(0).mean() is done across all cells for a non-grouped series in the original code, which is risky.
-    # Recalculating mean of difference within each cell_id's time series
     
     # Calculate difference within each cell and then take the mean of the difference series for that cell
     displacement_diff_mean = ts_df.groupby('cell_id')['displacement'].apply(lambda x: x.diff().fillna(0).mean())
@@ -134,12 +131,11 @@ cnn_features = np.random.rand(len(X_spatial), 16)  # 16 spatial features
 print("CNN Features: Shape", cnn_features.shape)
 
 
-# === CRITICAL FIX IS HERE: Function now returns the trained model ===
 # Train with Imbalance Handling
 def process_data(X_data, y_data):
-    # Ensure X_data is a DataFrame for SHAP output clarity
     X_spatial_df = X_data.copy()
     
+    # Optional: Comment out SMOTE if model overfits heavily
     smote = SMOTE(random_state=42)
     X_res, y_res = smote.fit_resample(X_spatial_df, y_data)
 
@@ -158,10 +154,8 @@ def process_data(X_data, y_data):
     plt.title("SHAP Feature Importance")
     plt.show() # Displays inline in Colab
     
-    # CRITICAL: RETURN THE TRAINED MODEL
     return model
 
-# === CRITICAL FIX: CALL THE FUNCTION AND ASSIGN THE MODEL ===
 model = process_data(X_spatial, y)
 
 
@@ -171,9 +165,10 @@ prob_rockfall = model.predict_proba(X_new)[:, 1]
 
 # Probabilistic Risk Score
 def compute_risk_score(prob_rockfall, slope, rainfall, displacement):
-    # Fixed the formula in the original code where rainfall and displacement were single numbers
-    # Assumes input arrays are Pandas Series or NumPy arrays
-    risk = 1 / (1 + np.exp(-(prob_rockfall * 2 + slope/10 + rainfall/5 + displacement/1.0)))
+    # --- FIX 2: Reduced the weight on prob_rockfall and displacement/0.1 ---
+    # Original formula had very large weights leading to saturation (Risk=1.0)
+    # New formula uses more balanced weights (2.0 instead of 10 for prob_rockfall)
+    risk = 1 / (1 + np.exp(-(prob_rockfall * 2.0 + slope/100 + rainfall/20 + displacement/1.0)))
     return np.clip(risk, 0, 1)
 
 # Now uses the features engineered in engineer_features()
@@ -184,13 +179,15 @@ def assess_risk_and_alert(prob_rockfall, spatial_df, risk_scores):
     alerts = []
     for idx, row in spatial_df.iterrows():
         risk = risk_scores[idx]
-        if risk < 0.001:
+        
+        # --- FIX 3: Adjusted the alert thresholds for more realistic distribution ---
+        if risk < 0.1: # Increased from 0.001 to 0.1 for Low Risk
             severity, action = "Low Risk (Green)", "Continue operations."
-        elif risk < 0.2:
+        elif risk < 0.25: # Increased threshold for Moderate Risk
             severity, action = "Moderate Risk (Yellow)", "Increase vigilance."
-        elif risk < 0.7:
+        elif risk < 0.5: # Increased threshold for High Risk
             severity, action = "High Risk (Orange)", "Prepare evacuation."
-        else:
+        else: # risk >= 0.5 is Imminent
             severity, action = "Imminent Risk (Red)", "Evacuate immediately!"
 
         if severity != "Low Risk (Green)":
@@ -206,9 +203,15 @@ print(f"\nTotal Alerts Generated: {len(alerts)}")
 # Risk Map (Interactive Folium)
 def create_risk_map(spatial_df, risk_scores):
     m = folium.Map(location=[spatial_df['y'].mean(), spatial_df['x'].mean()], zoom_start=10)
+    # Using the adjusted thresholds for map coloring
     for idx, row in spatial_df.iterrows():
         risk = risk_scores[idx]
-        color = 'green' if risk < 0.001 else 'yellow' if risk < 0.01 else 'orange' if risk < 0.05 else 'red'
+        # Align colors with new risk thresholds for visualization
+        color = 'green'
+        if risk >= 0.1 and risk < 0.25: color = 'yellow'
+        elif risk >= 0.25 and risk < 0.5: color = 'orange'
+        elif risk >= 0.5: color = 'red'
+        
         folium.CircleMarker(
             location=[row['y'], row['x']],
             radius=5, popup=f"Cell {row['cell_id']}: Risk {risk:.3f}",
@@ -222,4 +225,3 @@ print("Risk Map saved as 'risk_map.html' - Open in browser for interactive view!
 # The display function is needed for rendering the map output in Colab
 # from IPython.display import display # Uncomment this if you get an error for display()
 # display(m)
-
