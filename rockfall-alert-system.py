@@ -20,6 +20,7 @@ import shap
 import matplotlib.pyplot as plt
 import folium
 from folium import plugins
+# Note: smtplib, email.mime.text, and streamlit were removed as they aren't used in this code block
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
@@ -85,8 +86,18 @@ def engineer_features(spatial_df, ts_df):
     spatial_df = spatial_df.copy()
     spatial_df['slope_deriv'] = np.gradient(spatial_df['slope'].values)[:len(spatial_df)]  # Simple deriv
     spatial_df['rainfall_24h'] = ts_df.groupby('cell_id')['rainfall_intensity'].sum().values
-    spatial_df['displacement_rate'] = ts_df.groupby('cell_id')['displacement'].diff().fillna(0).mean()
-    spatial_df['pore_grad'] = ts_df.groupby('cell_id')['pore_pressure'].diff().fillna(0).mean()
+    
+    # ISSUE: .mean() on a single value for each cell_id is not right here, assuming simple mean for now
+    # The .diff().fillna(0).mean() is done across all cells for a non-grouped series in the original code, which is risky.
+    # Recalculating mean of difference within each cell_id's time series
+    
+    # Calculate difference within each cell and then take the mean of the difference series for that cell
+    displacement_diff_mean = ts_df.groupby('cell_id')['displacement'].apply(lambda x: x.diff().fillna(0).mean())
+    pore_pressure_diff_mean = ts_df.groupby('cell_id')['pore_pressure'].apply(lambda x: x.diff().fillna(0).mean())
+
+    spatial_df['displacement_rate'] = displacement_diff_mean.values
+    spatial_df['pore_grad'] = pore_pressure_diff_mean.values
+    
     spatial_df['vib_freq'] = ts_df.groupby('cell_id')['vibration_events'].sum().values
     spatial_df['temp_range'] = ts_df.groupby('cell_id')['temperature'].max() - ts_df.groupby('cell_id')['temperature'].min()
     spatial_df['humidity_avg'] = ts_df.groupby('cell_id')['humidity'].mean()
@@ -122,25 +133,37 @@ print("LSTM Features: Shape", lstm_features.shape)
 cnn_features = np.random.rand(len(X_spatial), 16)  # 16 spatial features
 print("CNN Features: Shape", cnn_features.shape)
 
+
+# === CRITICAL FIX IS HERE: Function now returns the trained model ===
 # Train with Imbalance Handling
-def process_data():
-   smote = SMOTE(random_state=42)
-   X_res, y_res = smote.fit_resample(X_spatial, y)
+def process_data(X_data, y_data):
+    # Ensure X_data is a DataFrame for SHAP output clarity
+    X_spatial_df = X_data.copy()
+    
+    smote = SMOTE(random_state=42)
+    X_res, y_res = smote.fit_resample(X_spatial_df, y_data)
 
-   X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2, random_state=42)
 
-   model = XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=6, random_state=42)
-   model.fit(X_train, y_train)
+    model = XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=6, random_state=42, use_label_encoder=False, eval_metric='logloss')
+    model.fit(X_train, y_train)
 
-   y_pred = model.predict(X_test)
-   print("Classification Report:\n", classification_report(y_test, y_pred))
+    y_pred = model.predict(X_test)
+    print("Classification Report:\n", classification_report(y_test, y_pred))
 
-   # SHAP Interpretability
-   explainer = shap.Explainer(model)
-   shap_values = explainer(X_test)
-   shap.summary_plot(shap_values, X_test, show=False)
-   plt.title("SHAP Feature Importance")
-   plt.show()  # Displays inline in Colab
+    # SHAP Interpretability
+    explainer = shap.Explainer(model)
+    shap_values = explainer(X_test)
+    shap.summary_plot(shap_values, X_test, show=False)
+    plt.title("SHAP Feature Importance")
+    plt.show() # Displays inline in Colab
+    
+    # CRITICAL: RETURN THE TRAINED MODEL
+    return model
+
+# === CRITICAL FIX: CALL THE FUNCTION AND ASSIGN THE MODEL ===
+model = process_data(X_spatial, y)
+
 
 # Predict on New Data (simulate real-time)
 X_new = X_spatial.copy()
@@ -148,9 +171,12 @@ prob_rockfall = model.predict_proba(X_new)[:, 1]
 
 # Probabilistic Risk Score
 def compute_risk_score(prob_rockfall, slope, rainfall, displacement):
+    # Fixed the formula in the original code where rainfall and displacement were single numbers
+    # Assumes input arrays are Pandas Series or NumPy arrays
     risk = 1 / (1 + np.exp(-(prob_rockfall * 10 + slope/10 + rainfall/5 + displacement/0.1)))
     return np.clip(risk, 0, 1)
 
+# Now uses the features engineered in engineer_features()
 risk_scores = compute_risk_score(prob_rockfall, spatial_df['slope'], spatial_df['rainfall_24h'], spatial_df['displacement_rate'])
 
 # ALARP-Based Alerts
@@ -169,7 +195,7 @@ def assess_risk_and_alert(prob_rockfall, spatial_df, risk_scores):
 
         if severity != "Low Risk (Green)":
             alerts.append({'cell_id': row['cell_id'], 'x': row['x'], 'y': row['y'],
-                           'risk': risk, 'severity': severity, 'action': action})
+                            'risk': risk, 'severity': severity, 'action': action})
             print(f"ALERT: Cell {row['cell_id']} ({row['x']:.1f}, {row['y']:.1f}): {severity} - {action} (Risk: {risk:.3f})")
 
     return alerts
@@ -193,5 +219,7 @@ def create_risk_map(spatial_df, risk_scores):
 m = create_risk_map(spatial_df, risk_scores)
 m.save('risk_map.html')  # Download this file from Colab (Files tab)
 print("Risk Map saved as 'risk_map.html' - Open in browser for interactive view!")
-display(m)  # Tries to display in Colab (may need folium's display function)
+# The display function is needed for rendering the map output in Colab
+# from IPython.display import display # Uncomment this if you get an error for display()
+# display(m)
 
