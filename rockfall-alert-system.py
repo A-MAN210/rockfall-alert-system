@@ -130,14 +130,20 @@ print("LSTM Features: Shape", lstm_features.shape)
 cnn_features = np.random.rand(len(X_spatial), 16)  # 16 spatial features
 print("CNN Features: Shape", cnn_features.shape)
 
+# --- NEW: COMBINE ALL FEATURES FOR XGBOOST TRAINING ---
+X_combined = pd.concat([
+    X_spatial.reset_index(drop=True), 
+    pd.DataFrame(lstm_features, columns=[f'lstm_{i}' for i in range(lstm_features.shape[1])]),
+    pd.DataFrame(cnn_features, columns=[f'cnn_{i}' for i in range(cnn_features.shape[1])])
+], axis=1)
+print(f"Combined Features for XGBoost: {X_combined.shape[1]}")
+
 
 # Train with Imbalance Handling
 def process_data(X_data, y_data):
     X_spatial_df = X_data.copy()
     
     # --- CRITICAL FIX 2: DISABLE SMOTE ---
-    # We are using original imbalanced data to prevent artificial overconfidence
-    # X_res, y_res = SMOTE(random_state=42).fit_resample(X_spatial_df, y_data)
     X_res = X_spatial_df
     y_res = y_data
     # -------------------------------------
@@ -171,11 +177,13 @@ def process_data(X_data, y_data):
     
     return model
 
-model = process_data(X_spatial, y)
+# --- CRITICAL CHANGE: Pass the combined feature set to the training function ---
+model = process_data(X_combined, y)
 
 
 # Predict on New Data (simulate real-time)
-X_new = X_spatial.copy()
+# --- CRITICAL CHANGE: Use the combined feature set for prediction ---
+X_new = X_combined.copy()
 prob_rockfall = model.predict_proba(X_new)[:, 1]
 
 # Probabilistic Risk Score
