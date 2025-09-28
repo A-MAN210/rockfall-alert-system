@@ -7,8 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/1I6KeQg8fuXD-wdoTsJVVbXmKqOFVE16O
 """
 
-!pip install pandas numpy scikit-learn xgboost tensorflow shap imbalanced-learn matplotlib folium
-
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
