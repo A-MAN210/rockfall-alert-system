@@ -52,8 +52,8 @@ def simulate_data(n_samples=5000, n_timesteps=24):  # Smaller for Colab speed
 
     prob_rockfall = (slope / 60 + rainfall_intensity[:, -1] / 50 + np.abs(displacement[:, -1]) / 10 +
                      fracture_density / 5 + historical_incidents) / 5
-    # --- FIX 1: Make simulated rockfall less deterministic by reducing final weight ---
-    prob_rockfall = np.clip(prob_rockfall * 0.05, 0, 1) # Changed from 0.1 to 0.05
+    # --- CRITICAL FIX 1: DRASTICALLY reduce the probability weight ---
+    prob_rockfall = np.clip(prob_rockfall * 0.005, 0, 1) # Changed from 0.05 to 0.005
     rockfall_event = np.random.binomial(1, prob_rockfall, n_samples)
 
     spatial_df = pd.DataFrame({
@@ -135,17 +135,32 @@ print("CNN Features: Shape", cnn_features.shape)
 def process_data(X_data, y_data):
     X_spatial_df = X_data.copy()
     
-    # Optional: Comment out SMOTE if model overfits heavily
-    smote = SMOTE(random_state=42)
-    X_res, y_res = smote.fit_resample(X_spatial_df, y_data)
+    # --- CRITICAL FIX 2: DISABLE SMOTE ---
+    # We are using original imbalanced data to prevent artificial overconfidence
+    # X_res, y_res = SMOTE(random_state=42).fit_resample(X_spatial_df, y_data)
+    X_res = X_spatial_df
+    y_res = y_data
+    # -------------------------------------
 
     X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2, random_state=42)
 
-    model = XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=6, random_state=42, use_label_encoder=False, eval_metric='logloss')
+    # Use scale_pos_weight to handle the imbalance instead of SMOTE (more robust)
+    # Estimate the weight: count_no_rockfall / count_rockfall
+    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+    
+    model = XGBClassifier(
+        n_estimators=100, 
+        learning_rate=0.1, 
+        max_depth=6, 
+        random_state=42, 
+        use_label_encoder=False, 
+        eval_metric='logloss',
+        scale_pos_weight=scale_pos_weight # Added scale_pos_weight
+    )
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
-    print("Classification Report:\n", classification_report(y_test, y_pred))
+    print("Classification Report (Imbalanced Data):\n", classification_report(y_test, y_pred))
 
     # SHAP Interpretability
     explainer = shap.Explainer(model)
@@ -165,9 +180,7 @@ prob_rockfall = model.predict_proba(X_new)[:, 1]
 
 # Probabilistic Risk Score
 def compute_risk_score(prob_rockfall, slope, rainfall, displacement):
-    # --- FIX 2: Reduced the weight on prob_rockfall and displacement/0.1 ---
-    # Original formula had very large weights leading to saturation (Risk=1.0)
-    # New formula uses more balanced weights (2.0 instead of 10 for prob_rockfall)
+    # This formula is now much less likely to saturate as prob_rockfall is expected to be small
     risk = 1 / (1 + np.exp(-(prob_rockfall * 2.0 + slope/100 + rainfall/20 + displacement/1.0)))
     return np.clip(risk, 0, 1)
 
@@ -180,14 +193,14 @@ def assess_risk_and_alert(prob_rockfall, spatial_df, risk_scores):
     for idx, row in spatial_df.iterrows():
         risk = risk_scores[idx]
         
-        # --- FIX 3: Adjusted the alert thresholds for more realistic distribution ---
-        if risk < 0.1: # Increased from 0.001 to 0.1 for Low Risk
+        # Thresholds are adjusted again to reflect the expected *lower* scores
+        if risk < 0.05:
             severity, action = "Low Risk (Green)", "Continue operations."
-        elif risk < 0.25: # Increased threshold for Moderate Risk
+        elif risk < 0.15:
             severity, action = "Moderate Risk (Yellow)", "Increase vigilance."
-        elif risk < 0.5: # Increased threshold for High Risk
+        elif risk < 0.35:
             severity, action = "High Risk (Orange)", "Prepare evacuation."
-        else: # risk >= 0.5 is Imminent
+        else: # risk >= 0.35 (lower threshold than before, but should work with new data)
             severity, action = "Imminent Risk (Red)", "Evacuate immediately!"
 
         if severity != "Low Risk (Green)":
@@ -208,9 +221,9 @@ def create_risk_map(spatial_df, risk_scores):
         risk = risk_scores[idx]
         # Align colors with new risk thresholds for visualization
         color = 'green'
-        if risk >= 0.1 and risk < 0.25: color = 'yellow'
-        elif risk >= 0.25 and risk < 0.5: color = 'orange'
-        elif risk >= 0.5: color = 'red'
+        if risk >= 0.05 and risk < 0.15: color = 'yellow'
+        elif risk >= 0.15 and risk < 0.35: color = 'orange'
+        elif risk >= 0.35: color = 'red'
         
         folium.CircleMarker(
             location=[row['y'], row['x']],
